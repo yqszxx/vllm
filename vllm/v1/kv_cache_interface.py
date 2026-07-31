@@ -1456,6 +1456,9 @@ class KVCacheConfig:
     hisparse_shared_host_pool: bool = False
     """Whether local TP ranks share one physical HiSparse host pool."""
 
+    num_cpu_blocks: int | None = None
+    """The unified number of CPU offload blocks, if CPU offloading is enabled."""
+
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
         """IDs of cache groups that participate in external KV transfer."""
