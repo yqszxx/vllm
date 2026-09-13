@@ -19,6 +19,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -854,6 +855,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
             or current_platform.is_rocm()
             or current_platform.is_xpu()
             or current_platform.is_device_capability_family(120)
+            or is_deepseek_v4_sm89(self.vllm_config)
         ):
             return out
         for layer_type in self._layer_types:

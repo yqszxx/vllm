@@ -34,6 +34,7 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
 )
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -568,6 +569,32 @@ def sparse_attn_indexer(
                     q_slice_cast = q_slice
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+                if is_deepseek_v4_sm89():
+                    from vllm.v1.attention.ops.mqa_logits_sm89 import (
+                        fp8_mqa_logits_triton,
+                    )
+
+                    for row in range(0, q_slice.shape[0], 128):
+                        end = min(row + 128, q_slice.shape[0])
+                        logits = fp8_mqa_logits_triton(
+                            q_slice_cast[row:end],
+                            (k_quant_cast, k_scale_cast),
+                            weights[chunk.token_start + row : chunk.token_start + end],
+                            cu_seqlen_ks[row:end],
+                            cu_seqlen_ke[row:end],
+                            clean_logits=False,
+                        )
+                        ops.top_k_per_row_prefill(
+                            logits,
+                            cu_seqlen_ks[row:end],
+                            cu_seqlen_ke[row:end],
+                            topk_indices[row:end],
+                            end - row,
+                            logits.stride(0),
+                            logits.stride(1),
+                            topk_tokens,
+                        )
+                    continue
                 if current_platform.is_xpu():
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
@@ -694,7 +721,21 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        if is_deepseek_v4_sm89():
+            from vllm.v1.attention.ops.mqa_logits_sm89 import (
+                fp8_paged_mqa_logits_triton,
+            )
+
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.max_seq_len,
+                clean_logits=False,
+            )
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -886,7 +927,23 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self._cp_kv_cache_interleave_size: int | None = None
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if is_deepseek_v4_sm89(vllm_config):
+            if use_fp4_cache:
+                raise ValueError(
+                    "DeepSeek V4 Flash on SM89 requires an FP8 Indexer cache"
+                )
+            from vllm.v1.attention.ops.mqa_logits_sm89 import warmup_mqa_logits
+
+            warmup_mqa_logits(
+                64,
+                head_dim,
+                torch.device("cuda", torch.accelerator.current_device_index()),
+            )
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and not is_deepseek_v4_sm89(vllm_config)
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."

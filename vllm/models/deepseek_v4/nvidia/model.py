@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_ep_group,
@@ -85,6 +85,7 @@ from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.flashinfer_moe_ep import (
     is_fi_moe_ep_backend,
     validate_fi_moe_ep_config,
@@ -1151,6 +1152,21 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     CUDA arches keep the FlashMLA path.
     """
     backend = vllm_config.attention_config.backend
+    if is_deepseek_v4_sm89(vllm_config):
+        from vllm.models.deepseek_v4.nvidia.sm89 import DeepseekV4SM89Attention
+
+        if backend not in (None, AttentionBackendEnum.TRITON_MLA_SPARSE_DSV4):
+            raise ValueError(
+                "DeepSeek V4 Flash on SM89 requires TRITON_MLA_SPARSE_DSV4"
+            )
+        parallel = vllm_config.parallel_config
+        if (
+            vllm_config.speculative_config is not None
+            or parallel.decode_context_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+        ):
+            raise ValueError("DeepSeek V4 Flash on SM89 requires non-speculative TP")
+        return DeepseekV4SM89Attention
     device_capability = current_platform.get_device_capability()
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
@@ -1306,6 +1322,17 @@ class DeepseekV4DecoderLayer(nn.Module):
                     hc_mult=self.hc_mult,
                     n_out=self.hc_mult * (2 + self.hc_mult),
                 )
+                if (
+                    is_deepseek_v4_sm89(vllm_config)
+                    and get_pp_group().is_first_rank
+                    and extract_layer_index(prefix) == 0
+                ):
+                    _HC_PRENORM_GEMM_TILELANG_KERNEL.register_warmup(
+                        vllm_config,
+                        hidden_size=self.hidden_size,
+                        hc_mult=1,
+                        n_out=self.hc_mult * (2 + self.hc_mult),
+                    )
             _MHC_POST_TILELANG_KERNEL.register_warmup(
                 hidden_size=self.hidden_size,
                 hc_mult=self.hc_mult,
@@ -1944,6 +1971,7 @@ class DeepseekV4ForCausalLM(
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        self._sm89_config = vllm_config if is_deepseek_v4_sm89(vllm_config) else None
         expert_dtype = getattr(config, "expert_dtype", "fp4")
         if expert_dtype != "fp4":
             self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
@@ -2008,10 +2036,14 @@ class DeepseekV4ForCausalLM(
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model(
-            input_ids, positions, intermediate_tensors, inputs_embeds
-        )
-        return hidden_states
+        # Worker execution does not keep the construction-time config context.
+        # Scope SM89 dispatch to this model's forward, including eager graph breaks.
+        if self._sm89_config is not None:
+            with set_current_vllm_config(self._sm89_config):
+                return self.model(
+                    input_ids, positions, intermediate_tensors, inputs_embeds
+                )
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
         """Pre-hc_head residual stream buffer (max_num_batched_tokens,
@@ -2027,6 +2059,10 @@ class DeepseekV4ForCausalLM(
 
     def process_weights_after_loading(self) -> None:
         self.model.finalize_mega_moe_weights()
+        if is_deepseek_v4_sm89():
+            for module in self.modules():
+                if isinstance(module, DeepseekV4Attention):
+                    module.fuse_input_gemm_weights()
         self.model.finalize_mhc_broadcast_weights()
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
