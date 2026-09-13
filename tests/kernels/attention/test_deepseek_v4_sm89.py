@@ -248,3 +248,95 @@ def test_sm89_broadcast_prenorm_uses_unexpanded_input(num_tokens):
     )
     torch.testing.assert_close(out[0], x.float() @ fn.T, atol=0.02, rtol=0.02)
     torch.testing.assert_close(sqrsum[0], x.float().square().sum(-1))
+
+
+def test_sm89_dspark_window_and_graph_replay(default_vllm_config, monkeypatch):
+    """Draft blocks retain future tokens beyond the causal window after replay."""
+    from types import SimpleNamespace
+
+    from tests.kernels.attention.test_rocm_triton_attn_dsv4 import (
+        _pack_fp8_ds_mla_cache,
+        _ref_sparse_decode_ragged,
+    )
+    from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+    from vllm.models.deepseek_v4.nvidia.sm89 import DeepseekV4SM89SWAMetadataBuilder
+    from vllm.v1.attention.ops.sm89_mla_sparse import _sparse_attn_decode_ragged_triton
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    config = default_vllm_config
+    config.model_config.hf_config.sliding_window = 128
+    config.model_config.max_model_len = 1024
+    monkeypatch.setattr(
+        config, "scheduler_config", SimpleNamespace(max_num_batched_tokens=10)
+    )
+    monkeypatch.setattr(
+        config,
+        "speculative_config",
+        SimpleNamespace(
+            num_speculative_tokens=5, parallel_drafting=True, use_dspark=lambda: True
+        ),
+    )
+    device = torch.device("cuda")
+    spec = SlidingWindowMLASpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.uint8,
+        sliding_window=128,
+    )
+    builder = DeepseekV4SM89SWAMetadataBuilder(spec, [], config, device)
+    common = create_common_attn_metadata(
+        BatchSpec([405, 405], [5, 5]), 256, device, arange_block_indices=True
+    )
+    common.causal = False
+    common.slot_mapping[-1] = -1  # Trailing graph padding must not gather KV.
+    metadata = builder.build(0, common)
+    indices_ptr = metadata.decode_swa_ragged_indices.data_ptr()
+    indptr_ptr = metadata.decode_swa_ragged_indptr.data_ptr()
+    torch.manual_seed(46)
+    q = torch.randn(10, 8, 512, device=device, dtype=torch.bfloat16) * 0.1
+    kv = torch.randn(1024, 512, device=device, dtype=torch.bfloat16) * 0.1
+    cache = _pack_fp8_ds_mla_cache(kv, 256, False)
+    sink = torch.randn(8, device=device) * 0.1
+    scale = 512**-0.5
+
+    def run():
+        return _sparse_attn_decode_ragged_triton(
+            q,
+            cache,
+            metadata.decode_swa_ragged_indices,
+            metadata.decode_swa_ragged_indptr,
+            scale,
+            sink,
+            448,
+            64,
+        )
+
+    run()
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = run()
+    for context in (12, 300, 400):
+        common.seq_lens.fill_(context + 5)
+        metadata = builder.build(0, common)
+        assert metadata.decode_swa_ragged_indices.data_ptr() == indices_ptr
+        assert metadata.decode_swa_ragged_indptr.data_ptr() == indptr_ptr
+        rows = [
+            list(range(req * 512 + max(context - 128, 0), req * 512 + context + 5))
+            for req in range(2)
+            for _ in range(5)
+        ]
+        rows[-1] = []
+        lengths = [len(row) for row in rows]
+        ref_ptr = torch.tensor([0, *lengths], device=device).cumsum(0).int()
+        torch.testing.assert_close(metadata.decode_swa_ragged_indptr, ref_ptr)
+        ref_indices = torch.tensor(
+            [index for row in rows for index in row], device=device, dtype=torch.int32
+        )
+        torch.testing.assert_close(
+            metadata.decode_swa_ragged_indices[: ref_indices.numel()], ref_indices
+        )
+        graph.replay()
+        ref = _ref_sparse_decode_ragged(q, cache, rows, scale, sink, 256)
+        torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-2)

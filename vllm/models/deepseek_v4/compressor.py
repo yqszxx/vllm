@@ -242,9 +242,15 @@ class DeepseekCompressor(nn.Module):
         # The head=512 cr>=128 no-overlap deep gather uses the two-stage
         # compressor, which needs an fp32 scratch [max_batched, 512] for
         # the intermediate compressed_kv.
-        # Currently only tested on ROCm
+        self._sm89_dspark = (
+            is_deepseek_v4_sm89(vllm_config)
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.use_dspark()
+        )
         self._use_two_stage_fused_compressor = (
-            _prefer_two_stage_compressor() and head_dim == 512 and not self.overlap
+            (_prefer_two_stage_compressor() or self._sm89_dspark)
+            and head_dim == 512
+            and not self.overlap
         )
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -469,10 +475,14 @@ class DeepseekCompressor(nn.Module):
         elif self._use_two_stage_fused_compressor:
             # head=512 cr>=128 (no overlap): two-pass split compressor on the
             # prefill suffix, single-pass on the decode prefix.
-            assert state_metadata.num_decode_tokens is not None
+            assert self._sm89_dspark or state_metadata.num_decode_tokens is not None
             compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
             extra_kwargs = {
-                "num_decode_tokens": state_metadata.num_decode_tokens,
+                # The single-pass C128 kernel's local stack cannot fit alongside
+                # DSpark on SM89, including during decode.
+                "num_decode_tokens": (
+                    0 if self._sm89_dspark else state_metadata.num_decode_tokens
+                ),
                 "compress_scratch": self._compress_scratch,
             }
         else:
