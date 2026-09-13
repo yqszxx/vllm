@@ -1102,11 +1102,17 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
             )
         parallel = vllm_config.parallel_config
         if (
-            vllm_config.speculative_config is not None
+            (
+                vllm_config.speculative_config is not None
+                and not vllm_config.speculative_config.use_dspark()
+            )
             or parallel.decode_context_parallel_size != 1
             or parallel.prefill_context_parallel_size != 1
         ):
-            raise ValueError("DeepSeek V4 Flash on SM89 requires non-speculative TP")
+            raise ValueError(
+                "DeepSeek V4 Flash on SM89 requires TP without context parallelism "
+                "and supports only DSpark speculative decoding"
+            )
         return DeepseekV4SM89Attention
     device_capability = current_platform.get_device_capability()
     if backend in (

@@ -397,13 +397,13 @@ class DeepseekV4SM89MetadataBuilder(DeepseekV4SparseMLAMetadataBuilder):
 
 
 class DeepseekV4SM89SWAMetadataBuilder(DeepseekSparseSWAMetadataBuilder):
-    # Speculative decoding is not supported by this backend.
+    # Draft updates must also refresh the ragged indices and indptr.
     supports_draft_decode_metadata_update = False
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
-        swa_index_width = self.window_size
+        swa_index_width = max(self.window_size, self.noncausal_index_width)
         self.decode_swa_ragged_indices_buffer = torch.empty(
             max_tokens * swa_index_width,
             dtype=torch.int32,
