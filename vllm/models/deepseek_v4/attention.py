@@ -52,6 +52,7 @@ from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
@@ -202,6 +203,8 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         layer_id = extract_layer_index(prefix)
 
         self.prefix = prefix  # Alias for compatibility with compressor
+        self.fused_input_weight: torch.Tensor | None = None
+        self.fused_input_splits: list[int] = []
         self.hidden_size = config.hidden_size
         self.n_heads = config.num_attention_heads
         assert self.n_heads % tp_size == 0
@@ -413,6 +416,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             if self.backend_cls.get_name() in (
                 "FLASHMLA_SPARSE_DSV4",
                 "ROCM_FLASHMLA_SPARSE_DSV4",
+                "TRITON_MLA_SPARSE_DSV4",
                 "XPU_V4_MLA_SPARSE",
             ):
                 from vllm.models.deepseek_v4.common.ops.cache_utils import (
@@ -447,7 +451,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     )
 
                     _COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS_KERNEL.register_warmup()
-                    if has_cutedsl():
+                    if has_cutedsl() and not is_deepseek_v4_sm89():
                         from vllm.models.deepseek_v4.nvidia.ops.dequant_gather_k_cutedsl import (  # noqa: E501
                             _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL,
                         )
@@ -455,6 +459,12 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                         _DEQUANT_GATHER_K_CACHE_CUTEDSL_KERNEL.register_warmup()
                     else:
                         _DEQUANTIZE_AND_GATHER_K_CACHE_KERNEL.register_warmup()
+                elif backend_name == "TRITON_MLA_SPARSE_DSV4":
+                    from vllm.models.deepseek_v4.common.ops.cache_utils import (
+                        _DEQUANTIZE_AND_GATHER_K_CACHE_KERNEL,
+                    )
+
+                    _DEQUANTIZE_AND_GATHER_K_CACHE_KERNEL.register_warmup()
                 elif backend_name == "FLASHINFER_MLA_SPARSE_DSV4":
                     from vllm.models.deepseek_v4.common.ops.cache_utils import (
                         _BUILD_FLASHINFER_MIXED_SPARSE_INDICES_KERNEL,
@@ -463,6 +473,33 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
 
                     _COMPUTE_GLOBAL_TOPK_INDICES_AND_LENS_KERNEL.register_warmup()
                     _BUILD_FLASHINFER_MIXED_SPARSE_INDICES_KERNEL.register_warmup()
+
+    def fuse_input_gemm_weights(self) -> None:
+        """Concatenate the three bf16 input projections into one weight."""
+        if self.fused_input_weight is not None:
+            return
+        if self.compressor is None or self.indexer is None:
+            return
+        if not is_deepseek_v4_sm89():
+            return
+        parts = [
+            self.compressor.fused_wkv_wgate.weight,
+            self.indexer.compressor.fused_wkv_wgate.weight,
+            self.indexer.weights_proj.weight,
+        ]
+        if any(
+            w is None or w.dtype != torch.bfloat16 or w.shape[1] != self.hidden_size
+            for w in parts
+        ):
+            return
+        merged = torch.cat([w.detach() for w in parts], dim=0).contiguous()
+        splits = [w.shape[0] for w in parts]
+        offset = 0
+        for w, n in zip(parts, splits):
+            w.data = merged[offset : offset + n]
+            offset += n
+        self.fused_input_weight = merged
+        self.fused_input_splits = splits
 
     def forward(
         self,
@@ -673,6 +710,29 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         # is the fan-out start event; ln_events[1..3] are per-aux done events.
         # On ROCm, aux_streams is None and execute_in_parallel runs serially.
         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
+
+        if self.fused_input_weight is not None:
+            fused_input_weight = self.fused_input_weight
+
+            def merged_input_gemm() -> torch.Tensor:
+                return torch.mm(
+                    hidden_states, fused_input_weight.T, out_dtype=torch.float32
+                )
+
+            aux_fns[0] = merged_input_gemm
+            qr_kv, (merged_out, _, _) = execute_in_parallel(
+                lambda: self._fused_wqa_wkv_gemm(hidden_states),
+                aux_fns,
+                self.ln_events[0],
+                self.ln_events[1:4],
+                aux_streams,
+                enable=hidden_states.shape[0]
+                <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            )
+            kv_score, indexer_kv_score, indexer_weights = merged_out.split(
+                self.fused_input_splits, dim=-1
+            )
+            return qr_kv, kv_score, indexer_kv_score, indexer_weights
 
         if self.compressor is not None:
             # Local ref so the closure keeps a non-None type for mypy.
@@ -943,7 +1003,9 @@ class DeepseekV4Indexer(nn.Module):
         if vllm_config.kernel_config.enable_jit_warmup:
             from vllm.utils.import_utils import has_cutedsl
 
-            if current_platform.is_cuda() and has_cutedsl():
+            if current_platform.is_cuda() and (
+                has_cutedsl() and not is_deepseek_v4_sm89()
+            ):
                 from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (  # noqa: E501
                     _INDEXER_Q_FP8_KERNEL,
                     _INDEXER_Q_MXFP4_KERNEL,
@@ -1039,7 +1101,10 @@ class DeepseekV4Indexer(nn.Module):
         if vllm_config.kernel_config.enable_jit_warmup:
             from vllm.utils.import_utils import has_cutedsl
 
-            if not has_cutedsl() and not current_platform.is_xpu():
+            if (
+                not (has_cutedsl() and not is_deepseek_v4_sm89())
+                and not current_platform.is_xpu()
+            ):
                 from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
                     _FUSED_INDEXER_Q_ROPE_MXFP4_TRITON_KERNEL,
                     _FUSED_INDEXER_Q_ROPE_QUANT_TRITON_KERNEL,

@@ -195,6 +195,17 @@ class GateLinear(ReplicatedLinear):
             output = bf16x3_router_gemm(x, self.weight)
             return output, None
 
+        from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
+
+        if is_deepseek_v4_sm89() and self._router_gemm_no_bias:
+            from vllm.model_executor.kernels.linear.gemv_sm89 import (
+                bf16_gemv,
+                should_use_triton_gemv,
+            )
+
+            if should_use_triton_gemv(x, self.weight):
+                return bf16_gemv(x, self.weight, self.out_dtype), None
+
         # Tier 4: cuBLAS bf16→fp32
         if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:
             output = torch.mm(x, self.weight.T, out_dtype=torch.float32)

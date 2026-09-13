@@ -25,6 +25,7 @@ from vllm.utils.deep_gemm import (
     has_deep_gemm,
     native_next_n_supported,
 )
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.math_utils import round_down
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import PIN_MEMORY
@@ -587,6 +588,8 @@ class DeepSeekV32IndexerDecodeMetadata:
     per_req_decode_lens: torch.Tensor | None = None
     decode_is_uniform: bool = True
     write_max_decode_len: int = 0
+    # Compressed output width; graph capture must reserve the full model limit.
+    max_seq_len: int = 0
     indices: torch.Tensor | None = None
 
 
@@ -1142,6 +1145,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         return chunks
 
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> DeepseekV32IndexerMetadata:
+        metadata = super().build_for_cudagraph_capture(common_attn_metadata)
+        if is_deepseek_v4_sm89(self.vllm_config) and metadata.decode is not None:
+            assert self.vllm_config.model_config is not None
+            metadata.decode.max_seq_len = (
+                self.vllm_config.model_config.max_model_len // self.compress_ratio
+            )
+        return metadata
+
     def build(
         self,
         common_prefix_len: int,
@@ -1463,7 +1477,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             schedule_metadata = self.scheduler_metadata_buffer
-            if current_platform.is_cuda() and has_deep_gemm():
+            if (
+                current_platform.is_cuda()
+                and has_deep_gemm()
+                and not is_deepseek_v4_sm89(self.vllm_config)
+            ):
                 metadata = get_paged_mqa_logits_metadata(
                     seq_lens,
                     self.kv_cache_spec.num_states,
@@ -1484,6 +1502,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 per_req_decode_lens=self.per_req_decode_lens_buffer[:num_decodes],
                 decode_is_uniform=write_is_uniform,
                 write_max_decode_len=max_decode_len,
+                max_seq_len=common_attn_metadata.max_seq_len // self.compress_ratio,
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(

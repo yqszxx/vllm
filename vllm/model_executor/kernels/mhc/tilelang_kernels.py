@@ -19,6 +19,7 @@ from vllm.model_executor.warmup.jit_warmup_tilelang_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.tilelang_utils import T, tilelang, tilelang_jit
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.math_utils import cdiv
 
 ENABLE_PDL = current_platform.is_arch_support_pdl() and current_platform.is_cuda()
@@ -1240,14 +1241,15 @@ class MhcPreBigFuseTileLangKernel(
         broadcast_norm_eps: float = 0.0,
         num_tokens: int = 1,
         use_fused_tilelang: bool = False,
+        sm89: bool = False,
         **compile_key_fields: float,
     ) -> CompileKey:
         pre_gemm_n_splits = (
             compute_num_split(64, pre_gemm_k, (num_tokens + 63) // 64)
-            if use_pre_gemm_splits
+            if use_pre_gemm_splits and not sm89
             else n_splits
         )
-        fused_n_splits = _mhc_fused_n_splits(num_tokens, hidden_size)
+        fused_n_splits = 16 if sm89 else _mhc_fused_n_splits(num_tokens, hidden_size)
         actual_n_splits = fused_n_splits if use_fused_tilelang else pre_gemm_n_splits
         actual_norm_eps = broadcast_norm_eps if is_broadcast else norm_eps
         actual_use_norm_weight = use_norm_weight or is_broadcast
@@ -1311,6 +1313,9 @@ class MhcPreBigFuseTileLangKernel(
         )
         return self._trace_dispatch(self.dispatch)(
             warmup_cases,
+            sm89=is_deepseek_v4_sm89(vllm_config)
+            and hidden_size == 4096
+            and hc_mult == 4,
             num_tokens=WarmupIntRange(
                 1,
                 max_tokens + 1,
@@ -1540,6 +1545,7 @@ class MhcFusedTileLangKernel(
         hc_mult: int
         n_splits: int
         tile_n: int
+        n_thr: int = 256
 
     @staticmethod
     def kernel() -> Any:
@@ -1553,13 +1559,15 @@ class MhcFusedTileLangKernel(
         hc_mult: int,
     ) -> CompileKey:
         # TODO(gnovack): investigate autotuning these heuristics
-        tile_n = 2 if num_tokens < 8 else 3
-        n_splits = _mhc_fused_n_splits(num_tokens, hidden_size)
+        sm89 = is_deepseek_v4_sm89() and hidden_size == 4096 and hc_mult == 4
+        tile_n = 6 if sm89 else (2 if num_tokens < 8 else 3)
+        n_splits = 16 if sm89 else _mhc_fused_n_splits(num_tokens, hidden_size)
         return self.CompileKey(
             hidden_size=hidden_size,
             hc_mult=hc_mult,
             n_splits=n_splits,
             tile_n=tile_n,
+            n_thr=128 if sm89 else 256,
         )
 
     def get_warmup_keys(
@@ -1570,6 +1578,13 @@ class MhcFusedTileLangKernel(
         hc_mult: int,
     ) -> list[CompileKey]:
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        if (
+            max_tokens > 0
+            and is_deepseek_v4_sm89(vllm_config)
+            and hidden_size == 4096
+            and hc_mult == 4
+        ):
+            return [self.CompileKey(hidden_size, hc_mult, 16, 6, 128)]
         return self._trace_dispatch(self.dispatch)(
             num_tokens=WarmupIntRange(1, max_tokens + 1),
             hidden_size=hidden_size,
@@ -1617,8 +1632,15 @@ class MhcFusedTileLangKernel(
         hc_mult3: int,
     ) -> TileLangLaunchSpec:
         num_tokens = residual_in.shape[0]
-        tile_n = 2 if num_tokens < 8 else 3
-        n_splits = _mhc_fused_n_splits(num_tokens, hidden_size)
+        if self._warming_key is not None:
+            tile_n = self._warming_key.tile_n
+            n_splits = self._warming_key.n_splits
+            n_thr = self._warming_key.n_thr
+        else:
+            sm89 = is_deepseek_v4_sm89() and hidden_size == 4096 and hc_mult == 4
+            tile_n = 6 if sm89 else (2 if num_tokens < 8 else 3)
+            n_splits = 16 if sm89 else _mhc_fused_n_splits(num_tokens, hidden_size)
+            n_thr = 128 if sm89 else 256
         yp_out = residual_in.new_empty(
             (n_splits, num_tokens, hc_mult3), dtype=torch.float32
         )
@@ -1639,7 +1661,7 @@ class MhcFusedTileLangKernel(
                 hidden_size,
                 hc_mult3,
             ),
-            dict(tile_n=tile_n, split_k=n_splits),
+            dict(n_thr=n_thr, tile_n=tile_n, split_k=n_splits),
             (yp_out, rp_out, residual_out),
         )
 

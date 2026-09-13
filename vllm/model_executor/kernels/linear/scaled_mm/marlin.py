@@ -19,6 +19,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 
 from .ScaledMMLinearKernel import (
     FP8ScaledMMLinearKernel,
@@ -73,6 +74,10 @@ class MarlinFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
             replace_parameter(layer, "weight", weight.data)
             replace_parameter(layer, scale_name, weight_scale.data)
         # Non-block: callers must pass weight in (K, N) layout.
+
+        if is_deepseek_v4_sm89() and getattr(layer, "is_bmm", False):
+            # The attention output projection consumes raw block-scaled weights.
+            return
 
         layer.input_scale = None
         prepare_fp8_layer_for_marlin(

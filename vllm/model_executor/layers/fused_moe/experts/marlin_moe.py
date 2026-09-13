@@ -547,6 +547,10 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             or quant_config.use_fp8_w8a16
         ), "Supports only {mxfp,nvfp,int}4_w4a16, int8_w8a16 or fp8_w8a16"
         self.input_dtype = get_marlin_input_dtype()
+        from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
+
+        self._reuse_workspace = is_deepseek_v4_sm89()
+        self._marlin_workspace: torch.Tensor | None = None
 
         super().__init__(
             moe_config=moe_config,
@@ -554,6 +558,13 @@ class MarlinExpertsBase(mk.FusedMoEExpertsModular):
             max_num_tokens=max_num_tokens,
             num_dispatchers=num_dispatchers,
         )
+
+    def marlin_workspace(self, device: torch.device) -> torch.Tensor | None:
+        if not self._reuse_workspace:
+            return None
+        if self._marlin_workspace is None or self._marlin_workspace.device != device:
+            self._marlin_workspace = marlin_make_workspace_new(device, 4)
+        return self._marlin_workspace
 
     @staticmethod
     def _supports_current_device() -> bool:
@@ -740,6 +751,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
                 intermediate_cache13=workspace2,
                 intermediate_cache2=workspace13,
                 input_dtype=self.input_dtype,
+                workspace=self.marlin_workspace(hidden_states.device),
             )
             return
 
@@ -850,6 +862,7 @@ class MarlinExperts(LoRAExpertsMixin, MarlinExpertsBase):
             intermediate_cache13=workspace2,
             intermediate_cache2=workspace13,
             input_dtype=self.input_dtype,
+            workspace=self.marlin_workspace(hidden_states.device),
         )
 
     def moe_sum(
@@ -974,6 +987,7 @@ class BatchedMarlinExperts(MarlinExpertsBase):
             w1_zeros=self.w1_zp,
             w2_zeros=self.w2_zp,
             input_dtype=self.input_dtype,
+            workspace=self.marlin_workspace(hidden_states.device),
             activation_func=activation_func,
             activation_config=self.activation_config,
         )

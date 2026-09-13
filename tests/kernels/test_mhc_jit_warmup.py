@@ -294,3 +294,56 @@ def test_tilelang_warmup_inputs_reproduce_compile_key(
     kernel.compile(compile_key)
 
     assert compiled == [expected_kernel]
+
+
+def test_sm89_fused_mhc_warmup_keeps_runtime_launch_parameters(monkeypatch):
+    """Compilation must retain SM89 tuning after leaving the model context."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.kernels.mhc import tilelang_kernels
+
+    monkeypatch.setattr(tilelang_kernels, "is_deepseek_v4_sm89", lambda *args: True)
+    kernel = MhcFusedTileLangKernel()
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128)
+    )
+    keys = kernel.get_warmup_keys(config, hidden_size=4096, hc_mult=4)
+    assert len(keys) == 1
+    for num_tokens in (1, 8, 16):
+        assert (
+            kernel.dispatch(num_tokens=num_tokens, hidden_size=4096, hc_mult=4)
+            == keys[0]
+        )
+
+    pre_keys = MhcPreBigFuseTileLangKernel().get_warmup_keys(
+        config,
+        hidden_size=4096,
+        hc_mult=4,
+        use_norm_weight=True,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=20,
+        norm_eps=1e-6,
+        include_broadcast_splits=True,
+    )
+    assert {(key.is_broadcast, key.n_splits) for key in pre_keys} == {
+        (False, 1),
+        (False, 16),
+        (True, 1),
+    }
+
+    calls = []
+    monkeypatch.setattr(
+        jit_warmup_tilelang_helper,
+        "compile_tilelang",
+        lambda jit_impl, *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(tilelang_kernels, "is_deepseek_v4_sm89", lambda *args: False)
+    kernel.compile(keys[0])
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert kwargs == dict(n_thr=128, tile_n=6, split_k=16)
+    assert args[5].shape == (16, 8, 24)
+    assert args[6].shape == (16, 8)

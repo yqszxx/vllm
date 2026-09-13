@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
 
@@ -35,7 +36,8 @@ def _hc_prenorm_gemm_outputs(
         tf32_hc_prenorm_gemm,
     )
 
-    use_deep_gemm = is_deep_gemm_supported() or not use_tilelang_fallback
+    sm89 = is_deepseek_v4_sm89()
+    use_deep_gemm = not sm89 and (is_deep_gemm_supported() or not use_tilelang_fallback)
     num_tokens = x.shape[0]
     n_splits = (
         compute_num_split(64, x.shape[1], cdiv(num_tokens, 64)) if use_deep_gemm else 1
@@ -53,7 +55,11 @@ def _hc_prenorm_gemm_outputs(
         dtype=torch.float32,
         device=x.device,
     )
-    if use_deep_gemm:
+    if sm89 and x.dtype == torch.bfloat16 and num_tokens >= 32:
+        from vllm.model_executor.kernels.mhc.sm89 import hc_prenorm_gemm_cublas
+
+        hc_prenorm_gemm_cublas(x, fn, out, sqrsum)
+    elif use_deep_gemm:
         tf32_hc_prenorm_gemm(x, fn, out, sqrsum, n_splits)
     else:
         from vllm.model_executor.kernels.mhc.tilelang_kernels import (
@@ -66,7 +72,7 @@ def _hc_prenorm_gemm_outputs(
             out,
             sqrsum,
             hidden_size,
-            hc_mult,
+            x.shape[1] // hidden_size if sm89 else hc_mult,
         )
     return out, sqrsum
 

@@ -14,6 +14,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.import_utils import has_cutedsl
 
 # MXFP4: 32 elements per block, packed 2 nibbles per byte, ue8m0 block scale.
@@ -595,7 +596,7 @@ def fused_indexer_q_rope_quant(
             dtype=torch.uint8,
             device=index_q.device,
         )
-        if has_cutedsl():
+        if has_cutedsl() and not is_deepseek_v4_sm89():
             # lazily import, otherwise some tests fail due to CUDA driver init failure.
             from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
                 _INDEXER_Q_MXFP4_KERNEL,
@@ -651,7 +652,7 @@ def fused_indexer_q_rope_quant(
     use_fnuz = fp8_dtype == torch.float8_e4m3fnuz
     fp8_max = 224.0 if use_fnuz else 448.0
     index_q_fp8 = torch.empty_like(index_q, dtype=fp8_dtype)
-    if has_cutedsl():
+    if has_cutedsl() and not is_deepseek_v4_sm89():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
         from vllm.models.deepseek_v4.nvidia.ops.fused_indexer_q_cutedsl import (
             _INDEXER_Q_FP8_KERNEL,

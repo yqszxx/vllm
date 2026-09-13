@@ -1028,3 +1028,67 @@ def test_deepseek_v4_mhc_broadcast_refit_refreshes_in_place(monkeypatch):
     assert layer.hc_attn_fn_broadcast is buffer
     expected = layer.hc_attn_fn.detach().view(-1, 2, 8).sum(dim=1)
     assert torch.equal(layer.hc_attn_fn_broadcast, expected)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not current_platform.is_device_capability(89),
+    reason="SM89 required",
+)
+@pytest.mark.parametrize("num_tokens", [1, 6, 24, 128])
+def test_sm89_mhc_fused_matches_reference(num_tokens, default_vllm_config, monkeypatch):
+    """Both decode FMA and prefill cuBLAS must preserve all four mHC outputs."""
+    from vllm.model_executor.kernels.mhc.tilelang import mhc_fused_post_pre_tilelang
+    from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_torch
+
+    monkeypatch.setattr(
+        default_vllm_config,
+        "model_config",
+        SimpleNamespace(
+            hf_config=SimpleNamespace(
+                model_type="deepseek_v4",
+                hidden_size=4096,
+                num_hidden_layers=43,
+                architectures=["DeepseekV4ForCausalLM"],
+            )
+        ),
+    )
+    torch.manual_seed(7)
+    x = torch.randn(num_tokens, 4096, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn(num_tokens, 4, 4096, device="cuda", dtype=torch.bfloat16)
+    post = torch.sigmoid(torch.randn(num_tokens, 4, 1, device="cuda")) * 2
+    comb = torch.softmax(torch.randn(num_tokens, 4, 4, device="cuda"), -1)
+    fn = torch.randn(24, 16384, device="cuda") / 128
+    scale = torch.ones(3, device="cuda")
+    base = torch.randn(24, device="cuda")
+    norm = torch.ones(4096, device="cuda", dtype=torch.bfloat16)
+    ref_residual = mhc_post_torch(x, residual, post, comb)
+    ref_post, ref_comb, ref_input = mhc_pre_torch(
+        ref_residual,
+        fn,
+        scale,
+        base,
+        1e-6,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+    )
+    f = ref_input.float()
+    ref_input = (f * torch.rsqrt(f.square().mean(-1, keepdim=True) + 1e-6)).bfloat16()
+    out = mhc_fused_post_pre_tilelang(
+        x,
+        residual,
+        post,
+        comb,
+        fn,
+        scale,
+        base,
+        1e-6,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+        norm_weight=norm,
+    )
+    for actual, ref in zip(out, (ref_residual, ref_post, ref_comb, ref_input)):
+        torch.testing.assert_close(actual.float(), ref.float(), atol=0.04, rtol=0.03)
