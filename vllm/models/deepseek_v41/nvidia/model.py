@@ -56,6 +56,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    spec_decode_needs_target_embed,
 )
 from vllm.models.common.ops.sequence_parallel import (
     sp_all_gather,
@@ -448,6 +449,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
             else:
                 residual = x
+                if self.engram is not None and engram_hashes is not None:
+                    # A PP stage starting at an engram layer receives the
+                    # previous sublayer's post; inject before this block's pre.
+                    residual = self.engram(
+                        residual,
+                        engram_hashes[:, self.engram.layer_hash_index],
+                        engram_mask,
+                    )
                 post_mix, res_mix, x, attn_pre = mhc_pre(
                     residual,
                     self.hc_attn_fn,
@@ -554,6 +563,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
+    supports_aux_hidden_states_over_pp = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -609,7 +620,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             self.candidate_block_buffer = None
 
-        if get_pp_group().is_first_rank:
+        if get_pp_group().is_first_rank or spec_decode_needs_target_embed(vllm_config):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -872,8 +883,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "pre_mix": pre_mix}
+                {
+                    "hidden_states": hidden_states,
+                    "pre_mix": pre_mix,
+                    **self.pack_local_aux_hidden_states(aux_hidden_states),
+                }
             )
+        aux_hidden_states = (
+            self.collect_remote_aux_hidden_states(intermediate_tensors)
+            + aux_hidden_states
+        )
 
         # MTP needs full HC states; otherwise collapse and normalize locally
         # before gathering to reduce communication.

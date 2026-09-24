@@ -1779,8 +1779,12 @@ def get_kv_cache_config_from_groups(
         group_spec = group.kv_cache_spec
         layers_by_spec: defaultdict[KVCacheSpec, list[str]] = defaultdict(list)
         if isinstance(group_spec, UniformTypeKVCacheSpecs):
+            # A PP stage owning none of a group's layers keeps the group's
+            # global spec, so only allocate the layers the group lists.
+            worker_layers = set(group.layer_names)
             for layer_name, spec in group_spec.kv_cache_specs.items():
-                layers_by_spec[spec].append(layer_name)
+                if layer_name in worker_layers:
+                    layers_by_spec[spec].append(layer_name)
         elif group.layer_names:
             layers_by_spec[group_spec].extend(group.layer_names)
 
