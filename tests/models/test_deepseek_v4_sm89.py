@@ -96,7 +96,7 @@ def test_sm89_input_fusion_preserves_outputs_and_weight_refit(
 
 
 def test_sm89_dispatch_excludes_other_models_and_architectures(monkeypatch):
-    """Shared helpers must not change V4.1, Vision, or other GPU dispatch."""
+    """Shared helpers cover the V4 and V4.1 Flash checkpoints only."""
     from types import SimpleNamespace
 
     from vllm.platforms import current_platform
@@ -104,14 +104,17 @@ def test_sm89_dispatch_excludes_other_models_and_architectures(monkeypatch):
 
     monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
     cases = [
-        (89, "deepseek_v4", "DeepseekV4ForCausalLM", 4096, True),
-        (86, "deepseek_v4", "DeepseekV4ForCausalLM", 4096, False),
-        (90, "deepseek_v4", "DeepseekV4ForCausalLM", 4096, False),
-        (89, "deepseek_v41", "DeepseekV41ForCausalLM", 4096, False),
-        (89, "deepseek_v4", "DeepseekV4ForConditionalGeneration", 4096, False),
-        (89, "deepseek_v4", "DeepseekV4ForCausalLM", 7168, False),
+        (89, "deepseek_v4", "DeepseekV4ForCausalLM", 4096, 43, True),
+        (86, "deepseek_v4", "DeepseekV4ForCausalLM", 4096, 43, False),
+        (90, "deepseek_v4", "DeepseekV4ForCausalLM", 4096, 43, False),
+        (89, "deepseek_v41", "DeepseekV41ForCausalLM", 5120, 40, True),
+        (90, "deepseek_v41", "DeepseekV41ForCausalLM", 5120, 40, False),
+        (89, "deepseek_v41", "DeepseekV41ForCausalLM", 4096, 43, False),
+        (89, "deepseek_v4", "DeepseekV41ForCausalLM", 5120, 40, False),
+        (89, "deepseek_v4", "DeepseekV4ForConditionalGeneration", 4096, 43, False),
+        (89, "deepseek_v4", "DeepseekV4ForCausalLM", 7168, 43, False),
     ]
-    for capability, model_type, architecture, hidden, expected in cases:
+    for capability, model_type, architecture, hidden, layers, expected in cases:
         monkeypatch.setattr(
             current_platform,
             "is_device_capability",
@@ -123,7 +126,7 @@ def test_sm89_dispatch_excludes_other_models_and_architectures(monkeypatch):
                     model_type=model_type,
                     architectures=[architecture],
                     hidden_size=hidden,
-                    num_hidden_layers=43,
+                    num_hidden_layers=layers,
                 )
             )
         )
