@@ -297,6 +297,37 @@ def test_sm89_marlin_preserves_block_fp8_for_grouped_output_projection(tokens):
     )
 
 
+@pytest.mark.parametrize("tokens", [8, 600])
+def test_sm89_v41_output_projection_reads_loaded_mxfp8(tokens):
+    """V4.1's wo_a keeps its checkpoint MXFP8 weight and E8M0 row scales.
+
+    The decode-sized count runs the W8A16 GEMM on the one-byte weight; the
+    prefill-sized one is past the chunk limit and dequantizes instead.
+    """
+    from vllm.models.deepseek_v41.nvidia.sm89 import _LoadedWeight
+    from vllm.v1.attention.ops.sm89_mla_sparse import _wo_a_bmm
+
+    torch.manual_seed(45)
+    layer = torch.nn.Module()
+    weight = (torch.randn(1024, 4096, device="cuda") * 0.1).to(torch.float8_e4m3fn)
+    scale_bytes = torch.randint(118, 124, (1024, 128), device="cuda").to(torch.uint8)
+    layer.register_parameter("weight", torch.nn.Parameter(weight, requires_grad=False))
+    layer.register_parameter(
+        "weight_scale", torch.nn.Parameter(scale_bytes, requires_grad=False)
+    )
+    _LoadedWeight().process_weights_after_loading(layer)
+    assert layer.weight.dtype == torch.float8_e4m3fn
+
+    o_ref = torch.randn(tokens, 1, 4096, device="cuda", dtype=torch.bfloat16) * 0.1
+    actual = _wo_a_bmm(o_ref, layer, 1, 1024)
+    scale = torch.exp2(scale_bytes.float() - 127)
+    dequantized = weight.float() * scale.repeat_interleave(32, 1)
+    ref = o_ref.float().squeeze(1) @ dequantized.t()
+    torch.testing.assert_close(
+        actual.float().squeeze(1), ref, atol=2e-2 * ref.abs().max().item(), rtol=2e-3
+    )
+
+
 @pytest.mark.parametrize("num_tokens", [1, 128])
 def test_sm89_broadcast_prenorm_uses_unexpanded_input(num_tokens):
     """The first layer's broadcast GEMM has hidden_size columns, not 4x."""
@@ -406,11 +437,13 @@ def test_sm89_dspark_window_and_graph_replay(default_vllm_config, monkeypatch):
         torch.testing.assert_close(out, ref, atol=2e-3, rtol=2e-2)
 
 
+@pytest.mark.parametrize("row_scales", [False, True])
 @pytest.mark.parametrize("n,k", [(4096, 1024), (1024, 4096), (1536, 4096)])
 @pytest.mark.parametrize("m", [1, 12, 36])
-def test_smallm_block_scaled_gemm_matches_dequantized_weights(m, n, k):
+def test_smallm_block_scaled_gemm_matches_dequantized_weights(m, n, k, row_scales):
     """The decode-shaped W8A16 GEMM must equal a BF16 matmul on dequantized
-    weights, including the shapes whose narrow N forces a split-K reduction.
+    weights, including the shapes whose narrow N forces a split-K reduction,
+    for both 128x128 block scales and MXFP8's per-row 1x32 scales.
 
     Lives here rather than in tests/kernels/quantization/test_block_fp8.py,
     which skips itself below compute capability 9.0 and so never runs on the
@@ -430,14 +463,15 @@ def test_smallm_block_scaled_gemm_matches_dequantized_weights(m, n, k):
     )
     # A ue8m0 checkpoint stores these as E8M0 bytes; the kernel only ever sees
     # them widened, so exercise both the widened tensor and its exact values.
+    block_n, block_k = (1, 32) if row_scales else (128, 128)
     scale = torch.exp2(
-        torch.randint(-8, -4, (n // 128, k // 128), device="cuda").float()
+        torch.randint(-8, -4, (n // block_n, k // block_k), device="cuda").float()
     )
 
     out = w8a16_block_scaled_smallm(x, weight, scale, torch.bfloat16)
-    dequantized = weight.float() * scale.repeat_interleave(128, 0).repeat_interleave(
-        128, 1
-    )
+    dequantized = weight.float() * scale.repeat_interleave(
+        block_n, 0
+    ).repeat_interleave(block_k, 1)
     torch.testing.assert_close(
         out.float(), x.float() @ dequantized.t(), atol=2e-2, rtol=2e-2
     )

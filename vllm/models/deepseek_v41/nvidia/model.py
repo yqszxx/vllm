@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_engram_dp_size,
@@ -83,6 +83,7 @@ from vllm.models.deepseek_v41.nvidia.flashinfer_sparse import (
 from vllm.models.deepseek_v41.nvidia.flashmla import DeepseekV4FlashMLAAttention
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
@@ -144,6 +145,27 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
     FlashMLA path.
     """
     backend = vllm_config.attention_config.backend
+    if is_deepseek_v4_sm89(vllm_config):
+        from vllm.models.deepseek_v41.nvidia.sm89 import DeepseekV41SM89Attention
+
+        if backend not in (None, AttentionBackendEnum.TRITON_MLA_SPARSE_DSV41):
+            raise ValueError(
+                "DeepSeek V4.1 Flash on SM89 requires TRITON_MLA_SPARSE_DSV41"
+            )
+        parallel = vllm_config.parallel_config
+        if (
+            (
+                vllm_config.speculative_config is not None
+                and not vllm_config.speculative_config.use_dspark()
+            )
+            or parallel.decode_context_parallel_size != 1
+            or parallel.prefill_context_parallel_size != 1
+        ):
+            raise ValueError(
+                "DeepSeek V4.1 Flash on SM89 requires TP without context "
+                "parallelism and supports only DSpark speculative decoding"
+            )
+        return DeepseekV41SM89Attention
     device_capability = current_platform.get_device_capability()
     if backend in (
         AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
@@ -1250,6 +1272,7 @@ class DeepseekV41LLMForCausalLM(
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        self._sm89_config = vllm_config if is_deepseek_v4_sm89(vllm_config) else None
         expert_dtype = getattr(config, "expert_dtype", "fp4")
         self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(
             expert_dtype, _linear_scale_param_name(vllm_config, expert_dtype)
@@ -1329,6 +1352,17 @@ class DeepseekV41LLMForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         lookback_token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        # Worker execution does not keep the construction-time config context.
+        # Scope SM89 dispatch to this model's forward, including eager graph breaks.
+        if self._sm89_config is not None:
+            with set_current_vllm_config(self._sm89_config):
+                return self.model(
+                    input_ids,
+                    positions,
+                    intermediate_tensors,
+                    inputs_embeds,
+                    lookback_token_ids=lookback_token_ids,
+                )
         hidden_states = self.model(
             input_ids,
             positions,

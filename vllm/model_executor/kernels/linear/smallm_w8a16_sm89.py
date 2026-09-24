@@ -8,9 +8,10 @@ with a deep ``cp.async`` pipeline. A decode step has a few dozen rows, so the
 same GEMM is pure weight streaming, and one block per SM leaves a third of the
 memory system idle -- a bare read of the same tensor needs 512 blocks to reach
 its peak. This kernel keeps Marlin's numerics (FP8 weights widened to BF16
-against a BF16 activation, one scale per 128x128 block, FP32 accumulate) and
-only changes the decomposition: narrow N tiles plus split-K, sized to fill the
-machine.
+against a BF16 activation, FP32 accumulate) and only changes the
+decomposition: narrow N tiles plus split-K, sized to fill the machine. Weights
+carry either one scale per 128x128 block or, as MXFP8 does, one per row and 32
+columns.
 
 Like ``gemv_sm89``, this is not registered as a linear kernel: it is called
 directly from the SM89 DeepSeek V4 Flash path.
@@ -52,6 +53,8 @@ def _w8a16_smallm_kernel(
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
     ATOMIC: tl.constexpr,
+    ROW_SCALE_K: tl.constexpr,
+    ROW_SCALES: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -66,8 +69,8 @@ def _w8a16_smallm_kernel(
     k_end = tl.minimum(k_start + k_per_split, K)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    # BLOCK_K is the scale group and BLOCK_N divides it, so a tile never
-    # straddles a scale boundary and the scale stays scalar.
+    # Block scales: BLOCK_K is the scale group and BLOCK_N divides it, so a
+    # tile never straddles a scale boundary and the scale stays scalar.
     s_row = (pid_n * BLOCK_N) // BLOCK_K
     for k0 in tl.range(k_start, k_end, BLOCK_K):
         offs_k = k0 + tl.arange(0, BLOCK_K)
@@ -82,8 +85,24 @@ def _w8a16_smallm_kernel(
             mask=mask_n[:, None] & mask_k[None, :],
             other=0.0,
         )
-        s = tl.load(s_ptr + s_row * stride_sn + k0 // BLOCK_K)
-        acc += tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s
+        if ROW_SCALE_K:
+            # Row scales vary inside the tile, so widen the weight with them;
+            # E8M0 scales keep the widened FP8 values exact in BF16.
+            offs_s = k0 // ROW_SCALE_K + tl.arange(0, ROW_SCALES)
+            s = tl.load(
+                s_ptr + offs_n[:, None] * stride_sn + offs_s[None, :],
+                mask=mask_n[:, None],
+                other=0.0,
+            )
+            w = tl.reshape(
+                tl.reshape(w.to(tl.float32), (BLOCK_N, ROW_SCALES, ROW_SCALE_K))
+                * s[:, :, None],
+                (BLOCK_N, BLOCK_K),
+            )
+            acc += tl.dot(x, tl.trans(w.to(tl.bfloat16)))
+        else:
+            s = tl.load(s_ptr + s_row * stride_sn + k0 // BLOCK_K)
+            acc += tl.dot(x, tl.trans(w.to(tl.bfloat16))) * s
 
     out_mask = mask_m[:, None] & mask_n[None, :]
     offs_out = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
@@ -134,10 +153,16 @@ def w8a16_block_scaled_smallm(
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
     """``x @ weight.T`` for BF16 ``x`` [M, K] and FP8 ``weight`` [N, K] carrying
-    one scale per 128x128 block, in a dtype Triton can load (a ue8m0
-    checkpoint stores them as E8M0 bytes and must be widened first)."""
+    one scale per 128x128 block or per row and 32 columns, in a dtype Triton
+    can load (a ue8m0 checkpoint stores them as E8M0 bytes and must be widened
+    first)."""
     m, k = x.shape
     n = weight.shape[0]
+    if weight_scale.shape == (n, k // 32):
+        row_scale_k = 32
+    else:
+        assert weight_scale.shape == (triton.cdiv(n, 128), triton.cdiv(k, 128))
+        row_scale_k = 0
     if m > MAX_M:
         out = x.new_empty((m, n), dtype=out_dtype)
         for start in range(0, m, MAX_M):
@@ -171,6 +196,8 @@ def w8a16_block_scaled_smallm(
         BLOCK_K=128,
         SPLIT_K=split_k,
         ATOMIC=atomic,
+        ROW_SCALE_K=row_scale_k,
+        ROW_SCALES=128 // row_scale_k if row_scale_k else 1,
         num_warps=num_warps,
         num_stages=3,
     )

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Dispatch for the DeepSeek V4 Flash SM89 implementation."""
+"""Dispatch for the DeepSeek V4 / V4.1 Flash SM89 implementation."""
 
 from typing import TYPE_CHECKING
 
@@ -8,6 +8,13 @@ from vllm.platforms import current_platform
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+
+# (model_type, architecture) -> (hidden_size, num_hidden_layers) of the Flash
+# checkpoints the SM89 path is sized and validated for.
+_FLASH_MODELS = {
+    ("deepseek_v4", "DeepseekV4ForCausalLM"): (4096, 43),
+    ("deepseek_v41", "DeepseekV41ForCausalLM"): (5120, 40),
+}
 
 
 def is_deepseek_v4_sm89(config: "VllmConfig | None" = None) -> bool:
@@ -37,9 +44,12 @@ def is_deepseek_v4_sm89(config: "VllmConfig | None" = None) -> bool:
     if config is None or config.model_config is None:
         return False
     hf_config = config.model_config.hf_config
-    return (
-        getattr(hf_config, "model_type", None) == "deepseek_v4"
-        and getattr(hf_config, "hidden_size", None) == 4096
-        and getattr(hf_config, "num_hidden_layers", None) == 43
-        and "DeepseekV4ForCausalLM" in (getattr(hf_config, "architectures", None) or [])
+    model_type = getattr(hf_config, "model_type", "")
+    shape = (
+        getattr(hf_config, "hidden_size", None),
+        getattr(hf_config, "num_hidden_layers", None),
+    )
+    return any(
+        _FLASH_MODELS.get((model_type, arch)) == shape
+        for arch in getattr(hf_config, "architectures", None) or []
     )

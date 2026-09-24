@@ -975,7 +975,7 @@ class SparseAttnIndexer(CustomOp):
             from vllm.v1.attention.ops.mqa_logits_sm89 import warmup_mqa_logits
 
             warmup_mqa_logits(
-                64,
+                vllm_config.model_config.hf_config.index_n_heads,
                 head_dim,
                 torch.device("cuda", torch.accelerator.current_device_index()),
             )
