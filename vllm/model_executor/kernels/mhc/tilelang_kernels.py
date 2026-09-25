@@ -19,6 +19,7 @@ from vllm.model_executor.warmup.jit_warmup_tilelang_helper import (
 )
 from vllm.platforms import current_platform
 from vllm.tilelang_utils import T, tilelang, tilelang_jit
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.math_utils import cdiv
 
 ENABLE_PDL = current_platform.is_arch_support_pdl() and current_platform.is_cuda()
@@ -1360,11 +1361,12 @@ class MhcPreBigFuseTileLangKernel(
         broadcast_norm_eps: float = 0.0,
         num_tokens: int = 1,
         use_fused_tilelang: bool = False,
+        sm89: bool = False,
         **compile_key_fields: float,
     ) -> CompileKey:
         pre_gemm_n_splits = (
             compute_num_split(64, pre_gemm_k, (num_tokens + 63) // 64)
-            if use_pre_gemm_splits
+            if use_pre_gemm_splits and not sm89
             else n_splits
         )
         # The epilogue reduces over whatever the fused kernel split the GEMM
@@ -1437,6 +1439,9 @@ class MhcPreBigFuseTileLangKernel(
         )
         return self._trace_dispatch(self.dispatch)(
             warmup_cases,
+            sm89=is_deepseek_v4_sm89(vllm_config)
+            and hidden_size == 4096
+            and hc_mult == 4,
             num_tokens=WarmupIntRange(
                 1,
                 max_tokens + 1,

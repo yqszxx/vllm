@@ -54,6 +54,7 @@ tests/models/test_deepseek_v4_dspark_rocm.py  # added by #52362 (2026-09-21), no
 tests/models/test_deepseek_v4_fi_moe_ep.py  # no models_*.yaml job collects this path
 tests/models/test_deepseek_v4_rocm_compressor_gemm_fusion.py  # no models_*.yaml job collects this path
 tests/models/test_deepseek_v4_rocm_wo_a.py  # added by #54894 (2026-09-20), no models_*.yaml job collects this path
+tests/models/test_deepseek_v4_sm89.py  # SM89-only, skips elsewhere; no models_*.yaml job collects this path
 tests/models/test_deepseek_v41_replay_start.py  # added by #56227 (2026-09-18), no models_*.yaml job collects this path
 tests/models/test_dspark_mla.py  # no models_*.yaml job collects this path
 tests/models/test_language_model_cache_is_weak.py  # no models_*.yaml job collects this path

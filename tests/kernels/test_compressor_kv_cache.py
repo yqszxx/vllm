@@ -1958,13 +1958,31 @@ def test_cutedsl_full_cache_store(compress_ratio: int, store_fp8: bool):
 
 
 @pytest.mark.skipif(
-    not current_platform.is_rocm(),
-    reason="two-stage split compressor is only enabled for ROCm at the moment",
+    not (
+        current_platform.is_rocm()
+        or (current_platform.is_cuda() and current_platform.is_device_capability(89))
+    ),
+    reason="two-stage split compressor requires ROCm or SM89",
 )
 @pytest.mark.parametrize("num_tokens", [1, 4, 8, 17])
 @pytest.mark.parametrize("kv_block_size", [16, 64])
-def test_fused_kv_insert_split(num_tokens: int, kv_block_size: int):
+def test_fused_kv_insert_split(
+    num_tokens: int, kv_block_size: int, default_vllm_config, monkeypatch
+):
     """Two-stage split compress+norm+rope+quant+insert for the head=512 KV cache."""
+    if current_platform.is_cuda() and current_platform.is_device_capability(89):
+        monkeypatch.setattr(
+            default_vllm_config,
+            "model_config",
+            SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    model_type="deepseek_v4",
+                    architectures=["DeepseekV4ForCausalLM"],
+                    hidden_size=4096,
+                    num_hidden_layers=43,
+                )
+            ),
+        )
     HEAD_DIM = 512
     NOPE_DIM = 448
     ROPE_DIM = 64
