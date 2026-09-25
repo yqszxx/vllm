@@ -323,3 +323,34 @@ def test_tilelang_warmup_inputs_reproduce_compile_key(
     kernel.compile(compile_key)
 
     assert compiled == [expected_kernel]
+
+
+def test_sm89_prenorm_warmup_keeps_single_split_gemm(monkeypatch):
+    """SM89 prenorm GEMMs run unsplit, so only the fused path needs a split key."""
+    from types import SimpleNamespace
+
+    from vllm.model_executor.kernels.mhc import tilelang_kernels
+
+    monkeypatch.setattr(tilelang_kernels, "is_deepseek_v4_sm89", lambda *args: True)
+    config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=128)
+    )
+    pre_keys = MhcPreBigFuseTileLangKernel().get_warmup_keys(
+        config,
+        hidden_size=4096,
+        hc_mult=4,
+        use_norm_weight=True,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=20,
+        norm_eps=1e-6,
+        include_broadcast_splits=True,
+    )
+    fused_splits = set(tilelang_kernels.mhc_fused_post_pre_splits(4096, 4))
+    assert {(key.is_broadcast, key.n_splits) for key in pre_keys} == {
+        (False, 1),
+        (True, 1),
+        *((False, n_splits) for n_splits in fused_splits),
+    }

@@ -665,3 +665,37 @@ def test_unwrap_recurses_through_nested_wrappers():
 
     assert inner.unwrap() is model
     assert outer.unwrap() is model
+
+
+@pytest.mark.parametrize("wide", [False, True])
+def test_sm89_attention_rebinds_breakpoints_after_late_enable(
+    monkeypatch, cuda_capture_stream, wide
+):
+    """Model discovery can import attention before graph auto-configuration."""
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphCapture
+    from vllm.models.deepseek_v4.attention import DeepseekV4Attention
+    from vllm.models.deepseek_v4.nvidia.sm89 import DeepseekV4SM89Attention
+
+    state = [1]
+
+    def unwrapped(out):
+        out.add_(state[0])
+
+    def init_without_weights(self):
+        torch.nn.Module.__init__(self)
+        self._sparse_indexer_and_attn = unwrapped
+        self._prepare_and_attn_eager = unwrapped
+        self._prepare_and_attn_fn = unwrapped if wide else lambda out: None
+
+    monkeypatch.setattr(DeepseekV4Attention, "__init__", init_without_weights)
+    attention = DeepseekV4SM89Attention()
+    fn = attention._prepare_and_attn_fn if wide else attention._sparse_indexer_and_attn
+    out = torch.zeros(1, device="cuda")
+    fn(out)
+    out.zero_()
+    with BreakableCUDAGraphCapture() as capture:
+        fn(out)
+    state[0] = 2
+    capture.replay()
+    assert capture.num_eager_breaks == 1
+    torch.testing.assert_close(out, torch.full_like(out, 3))

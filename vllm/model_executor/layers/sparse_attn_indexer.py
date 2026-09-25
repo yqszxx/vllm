@@ -34,6 +34,7 @@ from vllm.utils.deep_gemm import (
     fp8_fp4_paged_mqa_logits,
     has_deep_gemm,
 )
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.utils.import_utils import has_cutedsl
 from vllm.utils.torch_utils import (
     LayerNameType,
@@ -146,6 +147,50 @@ def dcp_gather_kv_rows(
     )
     return torch.index_select(
         gathered, 0, deinterleave_idx, out=out_buf[: deinterleave_idx.shape[0]]
+    )
+
+
+def _prefill_topk(
+    logits: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_tokens: int,
+    candidate_blocks: torch.Tensor | None,
+    candidate_block_size: int,
+    candidate_write: bool,
+) -> None:
+    """Select each prefill row's top-k from its logits; rows are independent."""
+    if candidate_blocks is not None:
+        # Two-level selection (v4.1): the candidate source
+        # publishes its top blocks; later indexers mask their
+        # scores to them. Both before the row top-k.
+        if candidate_write:
+            _select_candidate_blocks(
+                logits,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                candidate_blocks.shape[1],
+                candidate_block_size,
+                candidate_blocks,
+            )
+        else:
+            _apply_candidate_mask(
+                logits,
+                cu_seqlen_ks,
+                cu_seqlen_ke,
+                candidate_blocks,
+                candidate_block_size,
+            )
+    ops.top_k_per_row_prefill(
+        logits,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_indices,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        topk_tokens,
     )
 
 
@@ -568,6 +613,38 @@ def sparse_attn_indexer(
                     q_slice_cast = q_slice
                     k_quant_cast = k_quant
                     k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
+                if is_deepseek_v4_sm89():
+                    from vllm.v1.attention.ops.mqa_logits_sm89 import (
+                        fp8_mqa_logits_triton,
+                    )
+
+                    # 128-row blocks keep the transient logits a few MB; a
+                    # whole planned chunk can outgrow the headroom left
+                    # next to the KV cache and OOM under long contexts.
+                    for row in range(0, q_slice.shape[0], 128):
+                        end = min(row + 128, q_slice.shape[0])
+                        rows = slice(chunk.token_start + row, chunk.token_start + end)
+                        logits = fp8_mqa_logits_triton(
+                            q_slice_cast[row:end],
+                            (k_quant_cast, k_scale_cast),
+                            weights[rows],
+                            cu_seqlen_ks[row:end],
+                            cu_seqlen_ke[row:end],
+                            clean_logits=False,
+                        )
+                        _prefill_topk(
+                            logits,
+                            cu_seqlen_ks[row:end],
+                            cu_seqlen_ke[row:end],
+                            topk_indices[row:end],
+                            topk_tokens,
+                            None
+                            if candidate_blocks is None
+                            else candidate_blocks[rows],
+                            candidate_block_size,
+                            candidate_write,
+                        )
+                    continue
                 if current_platform.is_xpu():
                     if q_scale_slice is not None:
                         raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
@@ -588,40 +665,17 @@ def sparse_attn_indexer(
                         cu_seqlen_ke,
                         clean_logits=False,
                     )
-                num_rows = logits.shape[0]
-                if candidate_blocks is not None:
-                    # Two-level selection (v4.1): the candidate source
-                    # publishes its top blocks; later indexers mask their
-                    # scores to them. Both before the row top-k.
-                    chunk_candidates = candidate_blocks[
-                        chunk.token_start : chunk.token_end
-                    ]
-                    if candidate_write:
-                        _select_candidate_blocks(
-                            logits,
-                            cu_seqlen_ks,
-                            cu_seqlen_ke,
-                            chunk_candidates.shape[1],
-                            candidate_block_size,
-                            chunk_candidates,
-                        )
-                    else:
-                        _apply_candidate_mask(
-                            logits,
-                            cu_seqlen_ks,
-                            cu_seqlen_ke,
-                            chunk_candidates,
-                            candidate_block_size,
-                        )
-                ops.top_k_per_row_prefill(
+                _prefill_topk(
                     logits,
                     cu_seqlen_ks,
                     cu_seqlen_ke,
                     topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
                     topk_tokens,
+                    None
+                    if candidate_blocks is None
+                    else candidate_blocks[chunk.token_start : chunk.token_end],
+                    candidate_block_size,
+                    candidate_write,
                 )
 
             if deinterleave_idx is None:
@@ -707,7 +761,21 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        if is_deepseek_v4_sm89():
+            from vllm.v1.attention.ops.mqa_logits_sm89 import (
+                fp8_paged_mqa_logits_triton,
+            )
+
+            logits = fp8_paged_mqa_logits_triton(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.max_seq_len,
+                clean_logits=False,
+            )
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -899,7 +967,23 @@ class SparseAttnIndexer(CustomOp):
         self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
         self.use_pcp = parallel_config.prefill_context_parallel_size > 1
         self._cp_kv_cache_interleave_size: int | None = None
-        if current_platform.is_cuda() and not has_deep_gemm():
+        if is_deepseek_v4_sm89(vllm_config):
+            if use_fp4_cache:
+                raise ValueError(
+                    "DeepSeek V4 Flash on SM89 requires an FP8 Indexer cache"
+                )
+            from vllm.v1.attention.ops.mqa_logits_sm89 import warmup_mqa_logits
+
+            warmup_mqa_logits(
+                64,
+                head_dim,
+                torch.device("cuda", torch.accelerator.current_device_index()),
+            )
+        if (
+            current_platform.is_cuda()
+            and not has_deep_gemm()
+            and not is_deepseek_v4_sm89(vllm_config)
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM support in "
                 "the current vLLM environment."

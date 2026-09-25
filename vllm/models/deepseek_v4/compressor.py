@@ -21,6 +21,7 @@ from vllm.models.deepseek_v4.common.ops.save_partial_states import (
     _SAVE_PARTIAL_STATES_KERNEL,
 )
 from vllm.platforms import current_platform
+from vllm.utils.deepseek_v4_sm89 import is_deepseek_v4_sm89
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -241,9 +242,15 @@ class DeepseekCompressor(nn.Module):
         # The head=512 cr>=128 no-overlap deep gather uses the two-stage
         # compressor, which needs an fp32 scratch [max_batched, 512] for
         # the intermediate compressed_kv.
-        # Currently only tested on ROCm
+        self._sm89_dspark = (
+            is_deepseek_v4_sm89(vllm_config)
+            and vllm_config.speculative_config is not None
+            and vllm_config.speculative_config.use_dspark()
+        )
         self._use_two_stage_fused_compressor = (
-            _prefer_two_stage_compressor() and head_dim == 512 and not self.overlap
+            (_prefer_two_stage_compressor() or self._sm89_dspark)
+            and head_dim == 512
+            and not self.overlap
         )
         self.max_num_batched_tokens = (
             vllm_config.scheduler_config.max_num_batched_tokens
@@ -317,7 +324,11 @@ class DeepseekCompressor(nn.Module):
                 head_dim=self.head_dim,
                 compress_ratio=self.compress_ratio,
             )
-            if current_platform.is_cuda() and self.head_dim == 512:
+            if (
+                current_platform.is_cuda()
+                and self.head_dim == 512
+                and not is_deepseek_v4_sm89()
+            ):
                 from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (  # noqa: E501
                     _SPARSE_ATTN_COMPRESS_C128_BLOCK8_KERNEL,
                     _SPARSE_ATTN_COMPRESS_NORM_ROPE_STORE_C4_KERNEL,
@@ -443,7 +454,11 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        if (
+            current_platform.is_cuda()
+            and self.head_dim == 512
+            and not is_deepseek_v4_sm89()
+        ):
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 _SPARSE_ATTN_COMPRESSOR_CUTEDSL_KERNEL,
             )
@@ -460,10 +475,14 @@ class DeepseekCompressor(nn.Module):
         elif self._use_two_stage_fused_compressor:
             # head=512 cr>=128 (no overlap): two-pass split compressor on the
             # prefill suffix, single-pass on the decode prefix.
-            assert state_metadata.num_decode_tokens is not None
+            assert self._sm89_dspark or state_metadata.num_decode_tokens is not None
             compress_norm_rope_store_fn = compress_norm_rope_store_two_stage_triton
             extra_kwargs = {
-                "num_decode_tokens": state_metadata.num_decode_tokens,
+                # The single-pass C128 kernel's local stack cannot fit alongside
+                # DSpark on SM89, including during decode.
+                "num_decode_tokens": (
+                    0 if self._sm89_dspark else state_metadata.num_decode_tokens
+                ),
                 "compress_scratch": self._compress_scratch,
             }
         else:
