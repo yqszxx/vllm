@@ -116,6 +116,7 @@ from .ops.mhc import (
     supports_mhc_all_reduce,
     supports_mhc_overlap,
 )
+from .pipeline_sharing import maybe_build_pipeline_sharing
 
 if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
@@ -753,6 +754,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # ranks to belong to one NVLink domain. Collective: run before layers.
         self.run_gemm_rs = maybe_init_gemm_rs(vllm_config, self.use_sequence_parallel)
 
+        # Replicas of remote sharing sources must exist before the layers.
+        self.pipeline_sharing = maybe_build_pipeline_sharing(
+            vllm_config, prefix, self.topk_indices_buffer, self.candidate_block_buffer
+        )
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -866,7 +872,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer and keeps that shape until the final hc collapse — plus the
         # (num_tokens, hc_mult) pre-mix the next rank's first layer needs
         # for its attention collapse.
-        return IntermediateTensors(
+        tensors = IntermediateTensors(
             {
                 "hidden_states": torch.zeros(
                     (batch_size, self.hc_mult, self.config.hidden_size),
@@ -880,6 +886,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 ),
             }
         )
+        if self.pipeline_sharing is not None:
+            tensors.tensors.update(
+                self.pipeline_sharing.make_empty_tensors(batch_size, device)
+            )
+        return tensors
 
     def forward(
         self,
@@ -897,6 +908,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
+            if self.pipeline_sharing is not None:
+                self.pipeline_sharing.receive(intermediate_tensors)
 
         if self.use_mega_moe:
             input_ids = input_ids.to(torch.int64)
@@ -1024,6 +1037,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     "hidden_states": hidden_states,
                     "pre_mix": pre_mix,
                     **self.pack_local_aux_hidden_states(aux_hidden_states),
+                    **(
+                        self.pipeline_sharing.send(full_num_tokens)
+                        if self.pipeline_sharing is not None
+                        else {}
+                    ),
                 }
             )
         aux_hidden_states = (

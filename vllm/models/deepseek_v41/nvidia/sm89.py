@@ -16,6 +16,7 @@ from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.models.deepseek_v4.nvidia.sm89 import (
     DeepseekV4SM89SWAMetadata,
     DeepseekV4SM89SWAMetadataBuilder,
@@ -112,17 +113,27 @@ class DeepseekV41SM89Attention(DeepseekV4Attention):
             self.swa_cache_layer.bounded_replay = False
         self.wo_a.quant_method = _LoadedWeight()
         self._topk_ragged_cache: dict[int, _TopkRagged] = {}
-        self._index_source_prefix: str | None = None
+        # The layer memoizing the ragged topk of this layer's index source.
+        self._topk_ragged_owner: str | None = None
         if self.compress_ratio > 0:
             assert self.index_source_layer_id is not None
-            self._index_source_prefix = _replace_layer_index(
+            source_prefix = _replace_layer_index(
                 self.prefix, self.index_source_layer_id
             )
-            if self._index_source_prefix not in self._static_forward_context:
-                raise NotImplementedError(
-                    f"Index source {self._index_source_prefix} not found on "
-                    "this rank; PP splits inside a v4.1 index-sharing group "
-                    "are not supported."
+            context = self._static_forward_context
+            if isinstance(context.get(source_prefix), DeepseekV41SM89Attention):
+                self._topk_ragged_owner = source_prefix
+            else:
+                # The source is on an earlier pipeline stage, which relays its
+                # indices; this stage's leading consumers read them, and the
+                # first of them memoizes.
+                previous = context.get(
+                    _replace_layer_index(
+                        self.prefix, extract_layer_index(self.prefix) - 1
+                    )
+                )
+                self._topk_ragged_owner = (
+                    getattr(previous, "_topk_ragged_owner", None) or self.prefix
                 )
 
         if vllm_config.kernel_config.enable_jit_warmup:
@@ -238,14 +249,15 @@ class DeepseekV41SM89Attention(DeepseekV4Attention):
         """Ragged form of the topk indices this layer's index source published.
 
         It depends only on the shared ``topk_indices_buffer``, the step's
-        metadata and the compress ratio, so the source memoizes one result per
-        ratio for every layer that reads its indices.
+        metadata and the compress ratio, so the source (or, when it is on an
+        earlier pipeline stage, this stage's first reader) memoizes one result
+        per ratio for every layer that reads its indices.
         """
         assert swa_metadata.is_valid_token is not None
         assert self.topk_indices_buffer is not None
-        assert self._index_source_prefix is not None
+        assert self._topk_ragged_owner is not None
 
-        source = self._static_forward_context[self._index_source_prefix]
+        source = self._static_forward_context[self._topk_ragged_owner]
         if source is self:
             # Fresh indices as of this layer; drop what the last step cached.
             source._topk_ragged_cache = {}
