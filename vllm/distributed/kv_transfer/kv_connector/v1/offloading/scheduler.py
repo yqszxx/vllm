@@ -602,6 +602,15 @@ class OffloadingConnectorScheduler:
             for config in self.config.kv_group_configs
             if config.requires_cow_source
         )
+        # Tokens an EAGLE group's hit reads past its boundary; 0 without one.
+        self._eagle_peek_tokens = max(
+            (
+                config.tokens_per_block
+                for config in self.config.kv_group_configs
+                if config.is_eagle_group
+            ),
+            default=0,
+        )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
@@ -1495,6 +1504,30 @@ class OffloadingConnectorScheduler:
             return None
         return alignment_tokens // group_config.tokens_per_block
 
+    def _eagle_fallback_boundaries(
+        self, boundaries: tuple[int, ...], num_prompt_tokens: int
+    ) -> tuple[int, ...]:
+        """Previous aligned boundaries whose tails an EAGLE group needs.
+
+        An EAGLE group's hit at an aligned boundary also reads the block after
+        it. When the prompt ends inside that block, the block is never stored
+        and no hit can end at the boundary. Keeping every sliding window
+        group's tail at the previous aligned boundary as well lets the hit end
+        before it instead.
+        """
+        alignment_tokens = self.config.alignment_tokens
+        if not self._eagle_peek_tokens or alignment_tokens is None:
+            return ()
+        fallback = []
+        for boundary in boundaries:
+            aligned = round_down(boundary, alignment_tokens)
+            if (
+                aligned >= alignment_tokens
+                and aligned + self._eagle_peek_tokens > num_prompt_tokens
+            ):
+                fallback.append(aligned - 1)
+        return tuple(fallback)
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -1538,6 +1571,9 @@ class OffloadingConnectorScheduler:
                 reachable_boundaries = (req.num_prompt_tokens - 1,)
                 if req.shared_prefix_boundary:
                     reachable_boundaries += (req.shared_prefix_boundary,)
+                reachable_boundaries += self._eagle_fallback_boundaries(
+                    reachable_boundaries, req.num_prompt_tokens
+                )
 
             for group_config, group_state in zip(
                 self.config.kv_group_configs, req_status.group_states

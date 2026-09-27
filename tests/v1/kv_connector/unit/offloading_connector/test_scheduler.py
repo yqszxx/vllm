@@ -4455,6 +4455,89 @@ def test_retention_interval_zero_stores_only_replay_boundary(
     )
 
 
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_eagle_swa_restores_when_prompt_ends_inside_peek_block(
+    request_runner, async_scheduling: bool
+):
+    """An EAGLE sliding window group's hit also reads the block after the
+    aligned boundary. When the prompt ends inside that block it is never
+    stored, so the previous aligned boundary's tails are kept as well and the
+    hit ends one block before the replay boundary instead of missing.
+
+    Same shape as DeepSeek V4.1 with a DSpark drafter: the full attention
+    group sets a 4-block alignment and a hit needs 4 blocks, 5 for EAGLE.
+    """
+    swa_block_size = 4
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32
+            ),
+        ),
+        *(
+            KVCacheGroupSpec(
+                [f"layer{i}"],
+                SlidingWindowSpec(
+                    block_size=swa_block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                    sliding_window=16,
+                ),
+                is_eagle_group=i == 2,
+            )
+            for i in (1, 2)
+        ),
+    ]
+    runner = request_runner(
+        block_size=swa_block_size,
+        num_gpu_blocks=300,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+        retention_interval=0,
+    )
+
+    stored: set = set()
+
+    def store(keys, req_context):
+        # Like the real manager, skip keys that are already stored.
+        keys = [key for key in keys if key not in stored]
+        stored.update(keys)
+        return generate_store_output(keys)
+
+    # The replay boundary 64 is aligned; the peek block [64, 68) never fills.
+    runner.new_request(token_ids=[0] * 65)
+    runner.manager.prepare_store.side_effect = store
+    runner.run(decoded_tokens=[0])
+    runner.manager.prepare_store.side_effect = store
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # Tails at the replay boundary (blocks 12-15) and at 48 (8-11, plus
+        # the EAGLE peek block 12).
+        expected_stored=(
+            *((0, block) for block in range(4)),
+            *((group, block) for group in (1, 2) for block in range(8, 16)),
+        ),
+    )
+
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * 65)
+    runner.manager.lookup.side_effect = lambda key, req_context: (
+        LookupResult.HIT if key in stored else LookupResult.MISS
+    )
+    runner.manager.prepare_store.side_effect = store
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # The hit ends at 60: full attention loads its 4 blocks and each
+        # sliding window group the 4-block window before block 15.
+        expected_loaded=(
+            *((0, block) for block in range(4)),
+            *((group, block) for group in (1, 2) for block in range(11, 15)),
+        ),
+    )
+
+
 def _shared_kv_mtp_config():
     """Speculative config for a shared-group MTP model: eagle-family method
     whose drafter layer merges into a target KV-cache group, so no group
