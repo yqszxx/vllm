@@ -815,6 +815,10 @@ class KpoolTailMetadataBuilder(AttentionMetadataBuilder):
 
 def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     max_model_len = vllm_config.model_config.max_model_len
+    if is_deepseek_v4_sm89(vllm_config):
+        # 24 GiB cards: one full-length request per prefill chunk. At 1M
+        # tokens the 40x workspace below takes 4.9 GiB for a ratio-1 indexer.
+        return max_model_len
     # NOTE(Chen): 40 is a magic number for controlling the prefill buffer size.
     # Each entry is 128 fp8 bytes and 4 scale bytes for a total of 132 bytes.
     # The flashmla_sparse backend uses a workspace size of 5 * max_model_len.

@@ -133,6 +133,21 @@ def test_sm89_dispatch_excludes_other_models_and_architectures(monkeypatch):
         assert is_deepseek_v4_sm89(config) is expected
 
 
+def test_sm89_indexer_prefill_buffer_holds_one_full_request(monkeypatch):
+    """Upstream sizes the indexer prefill buffer for many full-length requests,
+    which at 1M tokens takes 4.9 GiB per GPU for a ratio-1 indexer; on SM89 it
+    holds one, and longer steps take more chunks."""
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.mla import indexer
+
+    config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=1 << 20))
+    monkeypatch.setattr(indexer, "is_deepseek_v4_sm89", lambda config: True)
+    assert indexer.get_max_prefill_buffer_size(config) == 1 << 20
+    monkeypatch.setattr(indexer, "is_deepseek_v4_sm89", lambda config: False)
+    assert indexer.get_max_prefill_buffer_size(config) > 1 << 20
+
+
 def test_sm89_forward_restores_config_context(monkeypatch, default_vllm_config):
     """Profiling and serving enter forward after the loader's context has exited."""
     from types import SimpleNamespace
