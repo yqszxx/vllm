@@ -224,9 +224,21 @@ class SingleTypeKVCacheManager(ABC):
             # `sum(reservations) <= pool` <=> `sum(peak_real_held) <= pool`.
             # Drift between the two would re-introduce the deadlock from
             # issue #39734 or, worse, mid-prefill OOM.
-            num_required_blocks = min(
-                num_required_blocks, self.max_admission_blocks_per_request
+            # The cap bounds real blocks, while `req_to_blocks` pads the blocks
+            # out of the window with nulls, so count only what is held.
+            num_skipped_blocks = (
+                self.get_num_skipped_tokens(total_computed_tokens) // self.block_size
             )
+            num_live_blocks = min(
+                max(num_required_blocks - num_skipped_blocks, 0),
+                self.max_admission_blocks_per_request,
+            )
+            num_held_blocks = 0
+            for block in reversed(self.req_to_blocks.get(request_id, ())):
+                if block.is_null:
+                    break
+                num_held_blocks += 1
+            return max(num_live_blocks - num_held_blocks, 0)
         num_req_blocks = len(self.req_to_blocks.get(request_id, ()))
 
         if request_id in self.num_cached_block:
